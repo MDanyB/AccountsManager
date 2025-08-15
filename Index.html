@@ -1,343 +1,677 @@
-import React, { useEffect, useMemo, useRef, useState } from "react";
-import { motion, AnimatePresence } from "framer-motion";
-import { Plus, Lock, Unlock, FolderPlus, Search, Trash2, Pencil, Eye, EyeOff, Copy, LogOut, ShieldCheck, Save, KeyRound, Users } from "lucide-react";
-import { v4 as uuidv4 } from "uuid";
-
-// Single-file React + Tailwind + framer-motion demo
-// SECURITY IMPROVEMENTS in this version:
-// - PBKDF2 iterations increased (configurable)
-// - Explicit checks preventing creating entries without selecting a folder (person)
-// - Folder creation and editing implemented via modal instead of prompt (works reliably in modern browsers)
-// - Export/Import encrypted blob (for backup)
-// - Basic password-strength hint and minimum-length checks
-// IMPORTANT: Still a demo. For production, use Argon2id, secure server-side storage, audited crypto.
-
-const STORAGE_KEY = "apv.vault";
-const DEFAULT_PBKDF2_ITERS = 400000; // increased from 250k
-
-const base64ToArrayBuffer = (b64) => Uint8Array.from(atob(b64), (c) => c.charCodeAt(0));
-const arrayBufferToBase64 = (buf) => btoa(String.fromCharCode(...new Uint8Array(buf)));
-
-async function deriveKey(password, saltB64, iterations = DEFAULT_PBKDF2_ITERS) {
-  const enc = new TextEncoder();
-  const salt = saltB64 ? base64ToArrayBuffer(saltB64) : crypto.getRandomValues(new Uint8Array(16));
-  const keyMaterial = await crypto.subtle.importKey(
-    "raw",
-    enc.encode(password),
-    { name: "PBKDF2" },
-    false,
-    ["deriveKey"]
-  );
-  const key = await crypto.subtle.deriveKey(
-    { name: "PBKDF2", salt, iterations, hash: "SHA-256" },
-    keyMaterial,
-    { name: "AES-GCM", length: 256 },
-    false,
-    ["encrypt", "decrypt"]
-  );
-  const saltOut = saltB64 || arrayBufferToBase64(salt);
-  return { key, saltB64: saltOut, iterations };
-}
-
-async function encryptVault(key, json) {
-  const iv = crypto.getRandomValues(new Uint8Array(12));
-  const encoded = new TextEncoder().encode(JSON.stringify(json));
-  const ct = await crypto.subtle.encrypt({ name: "AES-GCM", iv }, key, encoded);
-  return { iv: arrayBufferToBase64(iv), data: arrayBufferToBase64(ct) };
-}
-
-async function decryptVault(key, ivB64, dataB64) {
-  const iv = base64ToArrayBuffer(ivB64);
-  const data = base64ToArrayBuffer(dataB64);
-  const pt = await crypto.subtle.decrypt({ name: "AES-GCM", iv }, key, data);
-  return JSON.parse(new TextDecoder().decode(pt));
-}
-
-function saveEncryptedToStorage(payload) {
-  localStorage.setItem(STORAGE_KEY, JSON.stringify(payload));
-}
-function loadEncryptedFromStorage() {
-  const raw = localStorage.getItem(STORAGE_KEY);
-  if (!raw) return null;
-  try { return JSON.parse(raw); } catch { return null; }
-}
-
-function defaultPlainVault() { return { people: [], items: [] }; }
-const COLORS = ["#60a5fa","#34d399","#f472b6","#fbbf24","#a78bfa","#f87171","#22d3ee","#fb923c"];
-
-function prettyDate(iso){ try { return new Date(iso).toLocaleString(); } catch { return iso; } }
-
-export default function App(){
-  const [locked, setLocked] = useState(true);
-  const [hasExistingVault, setHasExistingVault] = useState(false);
-  const [master, setMaster] = useState("");
-  const [master2, setMaster2] = useState("");
-  const [working, setWorking] = useState(false);
-  const [saltB64, setSaltB64] = useState("");
-  const [cryptoKey, setCryptoKey] = useState(null);
-  const [plain, setPlain] = useState(defaultPlainVault());
-  const [search, setSearch] = useState("");
-  const [activePersonId, setActivePersonId] = useState(null);
-  const [showPasswords, setShowPasswords] = useState(false);
-  const [editItem, setEditItem] = useState(null);
-  const [personModal, setPersonModal] = useState({ open:false, editing:null, name:"", color: COLORS[0] });
-  const saveTimeout = useRef(null);
-
-  useEffect(()=>{
-    const existing = loadEncryptedFromStorage();
-    setHasExistingVault(!!existing);
-    if(existing?.salt) setSaltB64(existing.salt);
-  }, []);
-
-  async function handleCreateNewVault(){
-    if(!master || master.length < 8){ alert("Master password must be at least 8 characters."); return; }
-    if(master !== master2){ alert("Passwords do not match."); return; }
-    setWorking(true);
-    try{
-      const { key, saltB64 } = await deriveKey(master);
-      setCryptoKey(key);
-      setSaltB64(saltB64);
-      const initial = defaultPlainVault();
-      const enc = await encryptVault(key, initial);
-      saveEncryptedToStorage({ version:1, salt: saltB64, iv: enc.iv, data: enc.data, iterations: DEFAULT_PBKDF2_ITERS, lastSaved: new Date().toISOString() });
-      setPlain(initial);
-      setHasExistingVault(true);
-      setLocked(false);
-      alert("Vault created.");
-    }catch(e){ console.error(e); alert("Failed to create vault."); }
-    setWorking(false);
-  }
-
-  async function handleUnlock(){
-    setWorking(true);
-    try{
-      const stored = loadEncryptedFromStorage();
-      if(!stored){ alert("No vault found."); setWorking(false); return; }
-      const { key } = await deriveKey(master, stored.salt, stored.iterations || DEFAULT_PBKDF2_ITERS);
-      const dec = await decryptVault(key, stored.iv, stored.data);
-      setCryptoKey(key);
-      setSaltB64(stored.salt);
-      setPlain(dec);
-      setLocked(false);
-      alert("Unlocked.");
-    }catch(e){ console.error(e); alert("Incorrect password or corrupt vault."); }
-    setWorking(false);
-  }
-
-  async function persist(){
-    if(!cryptoKey) return;
-    const enc = await encryptVault(cryptoKey, plain);
-    saveEncryptedToStorage({ version:1, salt: saltB64, iv: enc.iv, data: enc.data, iterations: DEFAULT_PBKDF2_ITERS, lastSaved: new Date().toISOString() });
-  }
-
-  function lockNow(){ setLocked(true); setMaster(""); setMaster2(""); setCryptoKey(null); setPlain(defaultPlainVault()); setActivePersonId(null); }
-
-  // PERSON (folder) functions - modal-based
-  function openAddPerson(){ setPersonModal({ open:true, editing:null, name:"", color: COLORS[Math.floor(Math.random()*COLORS.length)] }); }
-  function openEditPerson(p){ setPersonModal({ open:true, editing:p, name:p.name, color:p.color }); }
-  function closePersonModal(){ setPersonModal({ open:false, editing:null, name:"", color: COLORS[0] }); }
-  function savePerson(){
-    const name = (personModal.name || "").trim();
-    if(!name){ alert("Name required."); return; }
-    // prevent duplicates
-    if(personModal.editing){
-      const people = plain.people.map(x=> x.id===personModal.editing.id ? { ...x, name, color: personModal.color } : x);
-      setPlain({ ...plain, people });
-    } else {
-      const id = uuidv4();
-      const person = { id, name, color: personModal.color };
-      const people = [...plain.people, person];
-      setPlain({ ...plain, people });
-      setActivePersonId(id);
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Local Password Vault</title>
+  <style>
+    :root {
+      --bg: #0b1020;
+      --panel: #121935;
+      --panel-2: #0e1530;
+      --text: #e7ecff;
+      --muted: #a8b3d9;
+      --accent: #7c9cff;
+      --accent-2: #5df2d6;
+      --danger: #ff6b6b;
+      --warn: #ffd166;
+      --ok: #95f985;
+      --shadow: 0 10px 30px rgba(0,0,0,.35);
+      --radius: 18px;
     }
-    closePersonModal();
-  }
+    * { box-sizing: border-box; }
+    html, body { height: 100%; }
+    body {
+      margin: 0; font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Inter, "Helvetica Neue", Arial, "Apple Color Emoji", "Segoe UI Emoji";
+      color: var(--text); background: radial-gradient(1200px 600px at 10% 10%, #111944, transparent 60%), radial-gradient(1000px 500px at 100% 0%, #0d163a, transparent 60%), var(--bg);
+      overflow: hidden;
+    }
+    a { color: var(--accent-2); text-decoration: none; }
 
-  function deletePerson(p){ if(!confirm(`Delete folder "${p.name}" and its entries?`)) return; const people = plain.people.filter(x=>x.id!==p.id); const items = plain.items.filter(x=>x.personId!==p.id); setPlain({ ...plain, people, items }); if(activePersonId===p.id) setActivePersonId(null); }
+    /* Nice scroll for long panels */
+    .scroll { overflow: auto; scrollbar-width: thin; }
+    .scroll::-webkit-scrollbar { width: 10px; height: 10px; }
+    .scroll::-webkit-scrollbar-thumb { background: #2b355f; border-radius: 999px; }
 
-  // ITEM functions
-  function openNewItem(personId){
-    const pid = personId || activePersonId || plain.people[0]?.id || null;
-    if(!pid){ alert("Please create/select a folder (person) first."); return; }
-    setEditItem({ id: uuidv4(), personId: pid, title:"", username:"", password:"", url:"", notes:"", createdAt: new Date().toISOString(), updatedAt: new Date().toISOString(), isNew:true });
-  }
-  function editExisting(it){ setEditItem({ ...it, isNew:false }); }
-  function saveItem(it){
-    if(!it.personId){ alert("Select a folder (person) for this entry."); return; }
-    const items = [...plain.items];
-    const idx = items.findIndex(x=>x.id===it.id);
-    it.updatedAt = new Date().toISOString();
-    if(idx>=0) items[idx]=it; else items.unshift(it);
-    setPlain({ ...plain, items });
-    setEditItem(null);
-  }
-  function deleteItem(it){ if(!confirm(`Delete entry "${it.title||it.username||'Untitled'}"?`)) return; const items = plain.items.filter(x=>x.id!==it.id); setPlain({ ...plain, items }); }
-  function copyToClipboard(text){ navigator.clipboard.writeText(text).then(()=> alert('Copied')); }
+    /* Layout */
+    .wrap { height: 100%; display: grid; place-items: center; padding: 24px; }
+    .card { width: min(980px, 96vw); background: linear-gradient(180deg, var(--panel), var(--panel-2)); border: 1px solid #202b59; border-radius: var(--radius); box-shadow: var(--shadow); position: relative; overflow: hidden; }
 
-  const filteredItems = useMemo(()=>{
-    let list = plain.items;
-    if(activePersonId) list = list.filter(x=>x.personId===activePersonId);
-    if(search.trim()){ const q = search.toLowerCase(); list = list.filter(x=> (x.title||"").toLowerCase().includes(q) || (x.username||"").toLowerCase().includes(q) || (x.url||"").toLowerCase().includes(q) || (x.notes||"").toLowerCase().includes(q)); }
-    return list;
-  }, [plain.items, activePersonId, search]);
+    /* Header */
+    .header { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 18px 22px; border-bottom: 1px solid #1d2852; background: linear-gradient(180deg, rgba(255,255,255,0.02), rgba(255,255,255,0)); }
+    .brand { display: flex; align-items: center; gap: 12px; font-weight: 700; letter-spacing: .4px; }
+    .brand .logo { width: 34px; height: 34px; border-radius: 10px; background: conic-gradient(from 0deg, var(--accent), var(--accent-2), var(--accent)); filter: drop-shadow(0 4px 14px rgba(124,156,255,.35)); animation: spin 8s linear infinite; }
+    @keyframes spin { to { transform: rotate(360deg); } }
 
-  // autosave debounce
-  useEffect(()=>{
-    if(locked || !cryptoKey) return;
-    if(saveTimeout.current) clearTimeout(saveTimeout.current);
-    saveTimeout.current = setTimeout(()=>{ persist(); }, 800);
-    return ()=> saveTimeout.current && clearTimeout(saveTimeout.current);
-  }, [plain, locked]);
+    /* Buttons */
+    .btn { --bgc: #1a2455; --fg: var(--text); --ring: rgba(124,156,255,.45);
+      appearance: none; border: 0; padding: 10px 14px; border-radius: 12px; background: var(--bgc);
+      color: var(--fg); font-weight: 600; cursor: pointer; transition: transform .06s ease, box-shadow .2s ease, background .2s ease, opacity .2s ease; box-shadow: 0 6px 16px rgba(0,0,0,.25), inset 0 -2px 0 rgba(255,255,255,.06);
+      display: inline-flex; align-items: center; gap: 10px; }
+    .btn:hover { transform: translateY(-1px); box-shadow: 0 10px 22px rgba(0,0,0,.3), 0 0 0 6px var(--ring); }
+    .btn:active { transform: translateY(0); }
+    .btn.ghost { background: transparent; border: 1px solid #273165; }
+    .btn.accent { --bgc: linear-gradient(180deg, #2a3d9a, #1f2b73); }
+    .btn.warn { --bgc: #5a3f00; }
+    .btn.danger { --bgc: #4a1520; }
+    .btn.small { padding: 8px 10px; border-radius: 10px; font-size: 13px; }
 
-  // backup/export and import
-  function exportVault(){ const raw = loadEncryptedFromStorage(); if(!raw){ alert('No vault to export'); return; } const blob = new Blob([JSON.stringify(raw)], { type: 'application/json' }); const url = URL.createObjectURL(blob); const a = document.createElement('a'); a.href = url; a.download = 'apv.vault.json'; a.click(); URL.revokeObjectURL(url); }
-  function importVaultFile(file){ const reader = new FileReader(); reader.onload = (e)=>{ try{ const parsed = JSON.parse(e.target.result); if(!parsed.data){ alert('Invalid vault file'); return; } saveEncryptedToStorage(parsed); setHasExistingVault(true); alert('Imported vault — now unlock with your master password.'); }catch(err){ alert('Failed to import'); } }; reader.readAsText(file); }
+    /* Inputs */
+    .field { display: grid; gap: 8px; }
+    .label { font-size: 12px; color: var(--muted); text-transform: uppercase; letter-spacing: .12em; }
+    .input, textarea, select { width: 100%; padding: 12px 14px; border-radius: 12px; border: 1px solid #253066; background: #0b1140; color: var(--text); outline: none; box-shadow: inset 0 -2px 0 rgba(255,255,255,.03); transition: border .2s ease, background .2s ease; }
+    .input:focus, textarea:focus, select:focus { border-color: #3850c5; background: #0a123f; }
+    textarea { min-height: 90px; resize: vertical; }
 
-  // UI: locked screen
-  if(locked) return (
-    <div className="min-h-screen w-full bg-gradient-to-br from-slate-900 via-slate-800 to-slate-900 text-white flex items-center justify-center p-6">
-      <div className="w-full max-w-xl bg-white/6 rounded-2xl p-6 backdrop-blur border border-white/10">
-        <div className="flex items-center gap-3 mb-4"><ShieldCheckIcon/> <h2 className="text-xl font-semibold">Animated Password Vault</h2></div>
-        {!hasExistingVault ? (
-          <div className="space-y-3">
-            <div className="text-sm">Create a new vault (master password). This will encrypt all data locally.</div>
-            <input type="password" placeholder="Master password (min 8)" value={master} onChange={(e)=>setMaster(e.target.value)} className="w-full p-2 rounded bg-white/10" />
-            <input type="password" placeholder="Confirm password" value={master2} onChange={(e)=>setMaster2(e.target.value)} className="w-full p-2 rounded bg-white/10" />
-            <div className="flex gap-2">
-              <button onClick={handleCreateNewVault} className="px-4 py-2 rounded bg-indigo-600">Create Vault</button>
-              <button onClick={()=>{ const f = document.createElement('input'); f.type='file'; f.accept='application/json'; f.onchange = (e)=> importVaultFile(e.target.files[0]); f.click(); }} className="px-4 py-2 rounded bg-white/5">Import Vault</button>
-            </div>
+    /* Sections */
+    .body { display: grid; grid-template-columns: 280px 1fr; min-height: 520px; }
+    .left { border-right: 1px solid #1d2852; padding: 16px; display: grid; grid-template-rows: auto auto 1fr auto; gap: 14px; }
+    .right { padding: 18px; display: grid; grid-template-rows: auto auto 1fr; gap: 14px; }
+
+    .panel { background: linear-gradient(180deg, rgba(255,255,255,.02), rgba(255,255,255,0)); border: 1px solid #1d2852; border-radius: 14px; padding: 12px; }
+
+    .profile-list { display: grid; gap: 8px; max-height: 240px; }
+    .profile { display: flex; align-items: center; justify-content: space-between; gap: 8px; padding: 10px 12px; border-radius: 12px; border: 1px solid transparent; background: #0b1140; cursor: pointer; transition: background .2s ease, border .2s ease, transform .06s ease; }
+    .profile:hover { background: #0d1349; }
+    .profile.active { border-color: #4053b7; background: #101955; }
+
+    .list { display: grid; gap: 10px; }
+    .item { display: grid; grid-template-columns: 1fr auto; gap: 8px; align-items: center; padding: 12px; border: 1px solid #22306b; border-radius: 12px; background: #0b1140; }
+    .item .meta { display: flex; align-items: center; gap: 10px; }
+    .badge { font-size: 11px; padding: 4px 8px; border-radius: 999px; border: 1px solid #29408f; color: #c6d3ff; background: #0c1545; }
+    .pill { font-size: 11px; padding: 4px 8px; border-radius: 999px; border: 1px solid #2d5f4f; color: #d6ffee; background: #0c2f26; }
+
+    .toolbar { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+    .spacer { flex: 1; }
+
+    .empty { text-align: center; padding: 40px 16px; color: var(--muted); }
+
+    /* Dialog/Modal */
+    .modal-backdrop { position: fixed; inset: 0; background: rgba(5,8,20,.65); opacity: 0; pointer-events: none; transition: opacity .2s ease; }
+    .modal-backdrop.show { opacity: 1; pointer-events: auto; }
+    .modal { position: fixed; inset: 0; display: grid; place-items: center; transform: scale(.98) translateY(6px); opacity: 0; pointer-events: none; transition: transform .2s ease, opacity .2s ease; }
+    .modal.show { transform: none; opacity: 1; pointer-events: auto; }
+    .modal .window { width: min(620px, 92vw); background: linear-gradient(180deg, var(--panel), var(--panel-2)); border: 1px solid #22306b; border-radius: 16px; padding: 16px; box-shadow: var(--shadow); }
+
+    /* Auth screens */
+    .auth { display: grid; gap: 16px; padding: 20px; }
+    .auth .title { font-size: 22px; font-weight: 800; }
+    .center { text-align: center; }
+
+    /* Toast */
+    .toast { position: fixed; right: 16px; bottom: 16px; display: grid; gap: 10px; }
+    .toast .t { padding: 12px 14px; border-radius: 12px; border: 1px solid #22306b; background: #0b1140; box-shadow: var(--shadow); animation: pop .25s ease; }
+    @keyframes pop { from { transform: translateY(8px); opacity: 0; } }
+
+    /* Password strength */
+    .strength { height: 8px; border-radius: 999px; background: #1a214a; overflow: hidden; }
+    .strength > div { height: 100%; width: 0%; background: linear-gradient(90deg, #ff6b6b, #ffd166, #95f985); transition: width .25s ease; }
+
+    /* Search */
+    .search { display: flex; gap: 8px; }
+
+    /* Lock screen blur overlay */
+    .blur { filter: blur(12px); pointer-events: none; user-select: none; }
+
+    /* Subtle glow ring around focused sections */
+    .glow { box-shadow: 0 0 0 2px rgba(124,156,255,.45); }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <div class="card" id="app">
+      <div class="header">
+        <div class="brand">
+          <div class="logo" aria-hidden></div>
+          <div>
+            <div style="font-size:15px; opacity:.9">Local Password Vault</div>
+            <div style="font-size:12px; color:var(--muted)"><span id="profileTitle">Protected</span></div>
           </div>
-        ) : (
-          <div className="space-y-3">
-            <div className="text-sm">Enter your master password to unlock.</div>
-            <input type="password" placeholder="Master password" value={master} onChange={(e)=>setMaster(e.target.value)} className="w-full p-2 rounded bg-white/10" />
-            <div className="flex gap-2">
-              <button onClick={handleUnlock} className="px-4 py-2 rounded bg-green-600">Unlock</button>
-              <button onClick={()=>{ const f = document.createElement('input'); f.type='file'; f.accept='application/json'; f.onchange = (e)=> importVaultFile(e.target.files[0]); f.click(); }} className="px-4 py-2 rounded bg-white/5">Import Vault</button>
-            </div>
-            <div className="text-xs text-white/70">If you forget your master password, your data cannot be recovered.</div>
-          </div>
-        )}
-      </div>
-    </div>
-  );
-
-  // Unlocked UI
-  return (
-    <div className="min-h-screen bg-gradient-to-br from-slate-900 via-slate-800 to-slate-900 text-white">
-      <div className="p-4 flex items-center justify-between border-b border-white/10">
-        <div className="flex items-center gap-3"><UsersIcon/><div className="font-semibold">Animated Password Vault</div><div className="text-xs text-white/60">(Demo — local only)</div></div>
-        <div className="flex items-center gap-2">
-          <input value={search} onChange={(e)=>setSearch(e.target.value)} placeholder="Search..." className="p-2 rounded bg-white/10" />
-          <button onClick={()=> openNewItem()} className="px-3 py-2 rounded bg-indigo-600">New Entry</button>
-          <div className="bg-white/5 p-2 rounded">
-            <button onClick={()=> setShowPasswords(s=>!s)} className="mr-2">{showPasswords? 'Hide':'Show'} pw</button>
-            <button onClick={persist} className="mr-2">Save</button>
-            <button onClick={exportVault} className="mr-2">Export</button>
-            <button onClick={lockNow}>Lock</button>
-          </div>
+        </div>
+        <div class="toolbar">
+          <button class="btn ghost small" id="btnLock" title="Lock (Esc)">🔒 Lock</button>
+          <button class="btn ghost small" id="btnExport">⬇️ Export</button>
+          <button class="btn ghost small" id="btnImport">⬆️ Import</button>
+          <button class="btn accent small" id="btnNewProfile">➕ New Folder</button>
         </div>
       </div>
 
-      <div className="grid grid-cols-12 gap-4 p-4">
-        <aside className="col-span-12 md:col-span-3 lg:col-span-2">
-          <div className="bg-white/5 p-3 rounded-xl">
-            <div className="flex items-center justify-between mb-2"><div className="font-semibold">Folders</div><button onClick={openAddPerson} className="p-1 rounded bg-white/10">New</button></div>
-            <div className="space-y-2 max-h-[60vh] overflow-auto">
-              {plain.people.length===0 && <div className="text-sm text-white/60">No folders yet.</div>}
-              {plain.people.map(p=> (
-                <motion.div key={p.id} layout initial={{ opacity:0,y:6 }} animate={{ opacity:1,y:0 }} className={`p-2 rounded ${activePersonId===p.id? 'bg-white/15':'bg-white/5'} flex items-center justify-between`} onClick={()=> setActivePersonId(p.id)}>
-                  <div className="flex items-center gap-2"><span style={{background:p.color}} className="w-3 h-3 rounded-full inline-block"/> <div className="text-sm">{p.name}</div></div>
-                  <div className="flex gap-1"><button onClick={(e)=>{ e.stopPropagation(); openEditPerson(p); }} className="p-1 rounded bg-white/6">Edit</button><button onClick={(e)=>{ e.stopPropagation(); deletePerson(p); }} className="p-1 rounded bg-red-600">Del</button></div>
-                </motion.div>
-              ))}
+      <div class="body" id="mainBody" aria-live="polite">
+        <aside class="left scroll">
+          <div class="panel">
+            <div class="field">
+              <label class="label">Search</label>
+              <div class="search">
+                <input class="input" id="search" placeholder="Find in current folder… (Ctrl/⌘+K)" />
+                <button class="btn small" id="btnClearSearch">✖</button>
+              </div>
+            </div>
+          </div>
+
+          <div class="panel profile-list scroll" id="profileList"></div>
+
+          <div class="panel">
+            <div class="field">
+              <label class="label">Auto‑lock</label>
+              <select id="autolock" class="input">
+                <option value="0">Never</option>
+                <option value="300000">5 minutes</option>
+                <option value="900000">15 minutes</option>
+                <option value="1800000" selected>30 minutes</option>
+              </select>
             </div>
           </div>
         </aside>
 
-        <main className="col-span-12 md:col-span-9 lg:col-span-10">
-          <div className="bg-white/5 p-4 rounded-2xl">
-            <div className="font-semibold mb-3">Entries</div>
-            <div className="grid sm:grid-cols-2 lg:grid-cols-3 gap-3">
-              <AnimatePresence>
-                {filteredItems.map(it=> (
-                  <motion.div key={it.id} layout initial={{opacity:0,y:8}} animate={{opacity:1,y:0}} exit={{opacity:0}} className="p-4 rounded-xl bg-white/10 border border-white/10">
-                    <div className="flex justify-between items-start">
-                      <div>
-                        <div className="font-semibold">{it.title||'Untitled'}</div>
-                        <div className="text-xs text-white/60">{prettyDate(it.updatedAt)}</div>
-                      </div>
-                      <div className="flex gap-1">
-                        <button onClick={()=> editExisting(it)} className="p-1 rounded bg-white/6">Edit</button>
-                        <button onClick={()=> deleteItem(it)} className="p-1 rounded bg-red-600">Del</button>
-                      </div>
-                    </div>
-                    {it.url && <a href={(it.url.startsWith('http')? it.url : 'https://'+it.url)} target="_blank" rel="noreferrer" className="block text-sm underline mt-2">{it.url}</a>}
-                    <div className="mt-2 text-sm">Username: <span className="font-mono">{it.username||'—'}</span></div>
-                    <div className="mt-2 text-sm">Password: <span className="font-mono">{it.password ? (showPasswords? it.password : '•'.repeat(Math.min(12,it.password.length))) : '—'}</span> {it.password && <button onClick={()=> copyToClipboard(it.password)} className="ml-2">Copy</button>}</div>
-                    {it.notes && <div className="mt-2 text-sm whitespace-pre-wrap text-white/80">{it.notes}</div>}
-                  </motion.div>
-                ))}
-              </AnimatePresence>
-            </div>
-            {filteredItems.length===0 && <div className="p-6 text-center text-white/60">No entries. Create one.</div>}
+        <section class="right scroll">
+          <div class="toolbar">
+            <div class="spacer"></div>
+            <button class="btn accent" id="btnNewItem">➕ New Entry</button>
           </div>
-        </main>
+
+          <div class="panel">
+            <div id="currentPath" style="font-size:13px; color:var(--muted); margin-bottom: 8px;">/</div>
+            <div class="list" id="itemList"></div>
+            <div class="empty" id="emptyState" hidden>
+              This folder has no items yet.
+            </div>
+          </div>
+        </section>
       </div>
 
-      {/* Person Modal */}
-      {personModal.open && (
-        <div className="fixed inset-0 bg-black/50 flex items-center justify-center">
-          <div className="bg-slate-800 p-4 rounded-lg w-full max-w-md">
-            <div className="flex justify-between items-center mb-2"><div className="font-semibold">{personModal.editing? 'Edit Folder' : 'New Folder'}</div><button onClick={closePersonModal}>X</button></div>
-            <div className="space-y-2">
-              <input value={personModal.name} onChange={(e)=> setPersonModal({...personModal, name: e.target.value})} placeholder="Folder (person) name" className="w-full p-2 rounded bg-white/6" />
-              <div className="flex gap-2 flex-wrap">
-                {COLORS.map(c=> (<button key={c} onClick={()=> setPersonModal({...personModal, color:c})} style={{background:c}} className={`w-8 h-8 rounded ${personModal.color===c? 'ring-2 ring-white':''}`} />))}
-              </div>
-              <div className="flex justify-end gap-2">
-                <button onClick={closePersonModal} className="px-3 py-1 rounded bg-white/6">Cancel</button>
-                <button onClick={savePerson} className="px-3 py-1 rounded bg-green-600">Save</button>
-              </div>
-            </div>
+      <!-- LOGIN / SETUP -->
+      <div id="authScreen" class="auth" hidden>
+        <div class="title">🔐 Welcome</div>
+        <div style="color:var(--muted)">This vault is stored <b>locally</b> in your browser and protected with your master password using AES‑GCM. No data leaves your device.</div>
+        <div id="loginForm">
+          <div class="field">
+            <label class="label">Master password</label>
+            <input id="masterPassword" class="input" type="password" placeholder="Enter master password" />
+          </div>
+          <div class="toolbar">
+            <button class="btn accent" id="btnUnlock">Unlock</button>
+            <div class="spacer"></div>
+            <button class="btn ghost" id="btnGoSetup">First time here? Create vault →</button>
           </div>
         </div>
-      )}
-
-      {/* Edit Item Modal */}
-      {editItem && (
-        <div className="fixed inset-0 bg-black/50 flex items-center justify-center">
-          <div className="bg-slate-800 p-4 rounded-lg w-full max-w-2xl">
-            <div className="flex justify-between items-center mb-2"><div className="font-semibold">{editItem.isNew? 'New Entry' : 'Edit Entry'}</div><button onClick={()=> setEditItem(null)}>X</button></div>
-            <div className="grid gap-2">
-              <div className="grid grid-cols-2 gap-2">
-                <input value={editItem.title} onChange={(e)=> setEditItem({...editItem, title: e.target.value})} placeholder="Title" className="p-2 rounded bg-white/6" />
-                <select value={editItem.personId||''} onChange={(e)=> setEditItem({...editItem, personId: e.target.value})} className="p-2 rounded bg-white/6">
-                  <option value="">— Select folder —</option>
-                  {plain.people.map(p=> (<option key={p.id} value={p.id}>{p.name}</option>))}
-                </select>
-              </div>
-              <div className="grid grid-cols-2 gap-2">
-                <input value={editItem.username} onChange={(e)=> setEditItem({...editItem, username: e.target.value})} placeholder="Username" className="p-2 rounded bg-white/6" />
-                <input value={editItem.password} onChange={(e)=> setEditItem({...editItem, password: e.target.value})} placeholder="Password" className="p-2 rounded bg-white/6" />
-              </div>
-              <input value={editItem.url} onChange={(e)=> setEditItem({...editItem, url: e.target.value})} placeholder="URL" className="p-2 rounded bg-white/6" />
-              <textarea value={editItem.notes} onChange={(e)=> setEditItem({...editItem, notes: e.target.value})} placeholder="Notes" className="p-2 rounded bg-white/6" rows={4} />
-              <div className="flex justify-end gap-2">
-                <button onClick={()=> setEditItem(null)} className="px-3 py-1 rounded bg-white/6">Cancel</button>
-                <button onClick={()=> saveItem(editItem)} className="px-3 py-1 rounded bg-green-600">Save</button>
-              </div>
-            </div>
+        <div id="setupForm" hidden>
+          <div class="field">
+            <label class="label">Create a master password</label>
+            <input id="setupPass" class="input" type="password" placeholder="Create a strong password" />
+            <div class="strength" aria-hidden><div id="strengthBar"></div></div>
+          </div>
+          <div class="field">
+            <label class="label">Confirm password</label>
+            <input id="setupPass2" class="input" type="password" placeholder="Repeat master password" />
+          </div>
+          <div class="toolbar">
+            <button class="btn accent" id="btnCreateVault">Create vault</button>
+            <div class="spacer"></div>
+            <button class="btn ghost" id="btnBackLogin">← Back to login</button>
           </div>
         </div>
-      )}
+        <div class="center" style="font-size: 12px; color: var(--muted)">Tip: you can export/import the <i>encrypted</i> vault file at any time.</div>
+      </div>
 
-      <div className="p-4 text-center text-xs text-white/50">Encrypted locally • If you lose the master password, data is unrecoverable.</div>
+      <!-- MODALS -->
+      <div class="modal-backdrop" id="backdrop" hidden></div>
+      <div class="modal" id="modal" hidden>
+        <div class="window">
+          <div id="modalContent"></div>
+        </div>
+      </div>
+
+      <div class="toast" id="toast"></div>
     </div>
-  );
-}
+  </div>
 
-// tiny icons fallback
-function ShieldCheckIcon(){ return (<svg className="h-6 w-6" viewBox="0 0 24 24" fill="none" stroke="currentColor"><path d="M12 2l7 3v5c0 5-3.5 9.74-7 12-3.5-2.26-7-7-7-12V5l7-3z" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round"/><path d="M9 12l2 2 4-4" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round"/></svg>); }
-function UsersIcon(){ return (<svg className="h-6 w-6" viewBox="0 0 24 24" fill="none" stroke="currentColor"><path d="M17 21v-2a4 4 0 00-4-4H7a4 4 0 00-4 4v2" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round"/><circle cx="9" cy="7" r="4" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round"/><path d="M23 21v-2a4 4 0 00-3-3.87" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round"/><path d="M16 3.13a4 4 0 010 7.75" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round"/></svg>); }
+  <script>
+    // ============================
+    // Utilities
+    // ============================
+    const $ = (sel, el=document) => el.querySelector(sel);
+    const $$ = (sel, el=document) => [...el.querySelectorAll(sel)];
+
+    const sleep = (ms) => new Promise(r => setTimeout(r, ms));
+
+    const fmtDate = (ms) => new Date(ms).toLocaleString();
+
+    function uuid() {
+      const b = new Uint8Array(16);
+      crypto.getRandomValues(b);
+      // RFC4122 v4
+      b[6] = (b[6] & 0x0f) | 0x40;
+      b[8] = (b[8] & 0x3f) | 0x80;
+      const h = [...b].map(x => x.toString(16).padStart(2,'0')).join('');
+      return `${h.substr(0,8)}-${h.substr(8,4)}-${h.substr(12,4)}-${h.substr(16,4)}-${h.substr(20)}`;
+    }
+
+    function toast(msg, type="") {
+      const t = document.createElement('div');
+      t.className = 't';
+      t.textContent = msg;
+      if (type === 'error') t.style.borderColor = '#612332';
+      if (type === 'ok') t.style.borderColor = '#2a634f';
+      $('#toast').appendChild(t);
+      setTimeout(() => t.remove(), 3000);
+    }
+
+    function confirmDialog({title, message, okText='Confirm', cancelText='Cancel'}) {
+      return new Promise((resolve) => {
+        openModal(`<div style="display:grid; gap:12px;">
+          <div style="font-weight:800; font-size:18px;">${title}</div>
+          <div style="color:var(--muted)">${message}</div>
+          <div class="toolbar">
+            <button class="btn danger" id="mOk">${okText}</button>
+            <div class="spacer"></div>
+            <button class="btn ghost" id="mCancel">${cancelText}</button>
+          </div>
+        </div>`);
+        $('#mOk').onclick = () => { closeModal(); resolve(true); };
+        $('#mCancel').onclick = () => { closeModal(); resolve(false); };
+      });
+    }
+
+    function passwordStrength(pw) {
+      let score = 0;
+      if (!pw) return 0;
+      const unique = new Set(pw).size;
+      const variety = [/[a-z]/, /[A-Z]/, /[0-9]/, /[^\w]/].reduce((s, re) => s + (re.test(pw) ? 1 : 0), 0);
+      score += Math.min(10, Math.floor(pw.length/2));
+      score += Math.min(6, variety * 2);
+      score += Math.min(6, Math.floor(unique/3));
+      return Math.min(22, score);
+    }
+
+    function generatePassword({length=16, digits=true, symbols=true, upper=true, lower=true}={}) {
+      let chars = '';
+      if (lower) chars += 'abcdefhijkmnopqrstuvwxyz';
+      if (upper) chars += 'ABCDEFGHJKLMNPQRSTUVWXYZ';
+      if (digits) chars += '23456789';
+      if (symbols) chars += '!@#$%^&*()_+-=[]{};:,.<>/?';
+      const a = new Uint32Array(length);
+      crypto.getRandomValues(a);
+      return [...a].map(n => chars[n % chars.length]).join('');
+    }
+
+    // ============================
+    // Crypto helpers (Web Crypto API)
+    // ============================
+    const VAULT_KEY = 'vault.encrypted.v1';
+    const META_KEY = 'vault.meta.v1';
+
+    const PBKDF2_ITER = 200_000; // tweakable
+
+    async function deriveKeyFromPassword(password, salt) {
+      const enc = new TextEncoder();
+      const keyMaterial = await crypto.subtle.importKey(
+        'raw', enc.encode(password), {name: 'PBKDF2'}, false, ['deriveKey']
+      );
+      return crypto.subtle.deriveKey(
+        {name: 'PBKDF2', salt, iterations: PBKDF2_ITER, hash: 'SHA-256'},
+        keyMaterial,
+        {name: 'AES-GCM', length: 256},
+        false,
+        ['encrypt','decrypt']
+      );
+    }
+
+    async function encryptJson(obj, key) {
+      const iv = crypto.getRandomValues(new Uint8Array(12));
+      const data = new TextEncoder().encode(JSON.stringify(obj));
+      const ct = new Uint8Array(await crypto.subtle.encrypt({name:'AES-GCM', iv}, key, data));
+      return { iv: btoa(String.fromCharCode(...iv)), ct: btoa(String.fromCharCode(...ct)) };
+    }
+
+    async function decryptJson(bundle, key) {
+      const iv = Uint8Array.from(atob(bundle.iv), c => c.charCodeAt(0));
+      const ct = Uint8Array.from(atob(bundle.ct), c => c.charCodeAt(0));
+      const pt = await crypto.subtle.decrypt({name:'AES-GCM', iv}, key, ct);
+      return JSON.parse(new TextDecoder().decode(pt));
+    }
+
+    // ============================
+    // Vault state (in-memory when unlocked)
+    // ============================
+    let masterKey = null; // CryptoKey
+    let vault = null;     // decrypted object
+    let activeProfile = null; // string name
+    let lastActive = Date.now();
+
+    const defaultVault = () => ({
+      version: 1,
+      createdAt: Date.now(),
+      updatedAt: Date.now(),
+      profiles: { 'Default': [] }
+    });
+
+    function touch() { lastActive = Date.now(); }
+
+    function setBlur(locked) {
+      const main = $('#mainBody');
+      if (!main) return;
+      if (locked) main.classList.add('blur'); else main.classList.remove('blur');
+    }
+
+    async function persistVault() {
+      if (!masterKey || !vault) return;
+      vault.updatedAt = Date.now();
+      const enc = await encryptJson(vault, masterKey);
+      localStorage.setItem(VAULT_KEY, JSON.stringify(enc));
+      const meta = JSON.parse(localStorage.getItem(META_KEY)||'{}');
+      meta.updatedAt = vault.updatedAt;
+      localStorage.setItem(META_KEY, JSON.stringify(meta));
+    }
+
+    function readMeta() {
+      return JSON.parse(localStorage.getItem(META_KEY) || 'null');
+    }
+
+    function writeMeta(meta) {
+      localStorage.setItem(META_KEY, JSON.stringify(meta));
+    }
+
+    async function loadVault(password) {
+      const raw = localStorage.getItem(VAULT_KEY);
+      const meta = readMeta();
+      if (!raw || !meta) throw new Error('No vault found');
+      const salt = Uint8Array.from(atob(meta.salt), c => c.charCodeAt(0));
+      const key = await deriveKeyFromPassword(password, salt);
+      const obj = await decryptJson(JSON.parse(raw), key); // throws if wrong
+      masterKey = key;
+      vault = obj;
+      activeProfile = activeProfile || Object.keys(vault.profiles)[0] || 'Default';
+      setBlur(false);
+      render();
+    }
+
+    async function createVault(password) {
+      const salt = crypto.getRandomValues(new Uint8Array(16));
+      const key = await deriveKeyFromPassword(password, salt);
+      masterKey = key;
+      vault = defaultVault();
+      activeProfile = 'Default';
+      const meta = { version: 1, createdAt: vault.createdAt, updatedAt: vault.updatedAt, iter: PBKDF2_ITER, salt: btoa(String.fromCharCode(...salt)) };
+      writeMeta(meta);
+      await persistVault();
+      setBlur(false);
+      render();
+    }
+
+    function lockVault() {
+      masterKey = null; vault = null; activeProfile = null; setBlur(true);
+      $('#authScreen').hidden = false;
+      $('#mainBody').hidden = true;
+      $('#profileTitle').textContent = 'Locked';
+    }
+
+    function ensureUnlocked() {
+      if (!vault) throw new Error('Vault is locked');
+    }
+
+    // ============================
+    // Rendering
+    // ============================
+    function render() {
+      if (!vault) return;
+      $('#authScreen').hidden = true;
+      $('#mainBody').hidden = false;
+      $('#profileTitle').textContent = `${activeProfile} • ${Object.keys(vault.profiles).length} folder(s)`;
+
+      // profiles
+      const pl = $('#profileList');
+      pl.innerHTML = '';
+      Object.keys(vault.profiles).sort((a,b)=>a.localeCompare(b)).forEach(name => {
+        const el = document.createElement('div');
+        el.className = 'profile' + (name===activeProfile ? ' active' : '');
+        el.innerHTML = `<div>📁 ${name}</div><div class="badge">${vault.profiles[name].length}</div>`;
+        el.onclick = () => { activeProfile = name; renderItems(); highlight(el); };
+        pl.appendChild(el);
+      });
+
+      renderItems();
+    }
+
+    function renderItems() {
+      const items = vault.profiles[activeProfile] || [];
+      const q = $('#search').value.trim().toLowerCase();
+      $('#currentPath').textContent = `/${activeProfile}${q ? ` — filtering: "${q}"`: ''}`;
+      const list = $('#itemList');
+      list.innerHTML = '';
+      const filtered = q ? items.filter(i => [i.title, i.username, i.url, i.notes].some(v => (v||'').toLowerCase().includes(q))) : items;
+
+      if (!filtered.length) { $('#emptyState').hidden = false; return; }
+      $('#emptyState').hidden = true;
+
+      filtered.sort((a,b)=>b.updatedAt - a.updatedAt).forEach(it => {
+        const row = document.createElement('div');
+        row.className = 'item';
+        const masked = '•'.repeat(12);
+        row.innerHTML = `
+          <div>
+            <div class="meta"><span style="font-weight:700">${it.title||'(no title)'} </span>
+              ${it.url ? `<a href="${it.url}" target="_blank" rel="noopener" class="badge">open</a>` : ''}
+              <span class="pill" title="Updated at">${new Date(it.updatedAt).toLocaleString()}</span>
+            </div>
+            <div style="font-size:13px; color:var(--muted); margin-top:4px;">👤 ${it.username||'—'} • 🔑 <span data-pw="${it.id}">${masked}</span></div>
+          </div>
+          <div class="toolbar">
+            <button class="btn small" data-action="reveal" data-id="${it.id}">👁️‍🗨️</button>
+            <button class="btn small" data-action="copy" data-id="${it.id}">📋 Copy</button>
+            <button class="btn small" data-action="edit" data-id="${it.id}">✏️ Edit</button>
+            <button class="btn small danger" data-action="del" data-id="${it.id}">🗑️</button>
+          </div>`;
+        list.appendChild(row);
+      });
+    }
+
+    function highlight(el) {
+      el.classList.add('glow');
+      setTimeout(()=>el.classList.remove('glow'), 600);
+    }
+
+    // ============================
+    // Modals
+    // ============================
+    function openModal(html) {
+      $('#modalContent').innerHTML = html;
+      $('#backdrop').hidden = false; $('#modal').hidden = false;
+      setTimeout(()=>{ $('#backdrop').classList.add('show'); $('#modal').classList.add('show'); }, 10);
+    }
+    function closeModal() {
+      $('#backdrop').classList.remove('show'); $('#modal').classList.remove('show');
+      setTimeout(()=>{ $('#backdrop').hidden = true; $('#modal').hidden = true; $('#modalContent').innerHTML=''; }, 180);
+    }
+
+    function itemForm(existing) {
+      const data = existing || { id: uuid(), title:'', username:'', password: generatePassword({length:20}), url:'', notes:'' };
+      openModal(`<div style="display:grid; gap:14px;">
+        <div style="font-weight:800; font-size:18px;">${existing ? 'Edit' : 'New'} entry</div>
+        <div class="field"><label class="label">Title</label><input id="f_title" class="input" value="${escapeHtml(data.title)}" /></div>
+        <div class="field"><label class="label">Username / Email</label><input id="f_user" class="input" value="${escapeHtml(data.username)}" /></div>
+        <div class="field"><label class="label">Password</label>
+          <div style="display:flex; gap:8px;">
+            <input id="f_pass" class="input" type="text" value="${escapeHtml(data.password)}" />
+            <button class="btn small" id="btnGen">🎲</button>
+            <button class="btn small" id="btnCopyPass">📋</button>
+          </div>
+        </div>
+        <div class="field"><label class="label">URL</label><input id="f_url" class="input" value="${escapeHtml(data.url)}" /></div>
+        <div class="field"><label class="label">Notes</label><textarea id="f_notes" class="input">${escapeHtml(data.notes)}</textarea></div>
+        <div class="toolbar">
+          <button class="btn accent" id="mSave">${existing ? 'Save changes' : 'Add to folder'}</button>
+          <div class="spacer"></div>
+          <button class="btn ghost" id="mCancel">Cancel</button>
+        </div>
+      </div>`);
+      $('#btnGen').onclick = () => { $('#f_pass').value = generatePassword({length:20}); toast('New password generated'); };
+      $('#btnCopyPass').onclick = async () => { await navigator.clipboard.writeText($('#f_pass').value); toast('Password copied','ok'); };
+      $('#mCancel').onclick = closeModal;
+      $('#mSave').onclick = async () => {
+        ensureUnlocked();
+        const entry = { id: data.id, title: $('#f_title').value.trim(), username: $('#f_user').value.trim(), password: $('#f_pass').value, url: $('#f_url').value.trim(), notes: $('#f_notes').value.trim(), updatedAt: Date.now() };
+        const list = vault.profiles[activeProfile];
+        const ix = list.findIndex(x => x.id===entry.id);
+        if (ix>=0) list[ix] = entry; else list.push(entry);
+        await persistVault();
+        renderItems();
+        closeModal();
+        toast(existing? 'Saved' : 'Added','ok');
+      };
+    }
+
+    function profileForm() {
+      openModal(`<div style="display:grid; gap:12px;">
+        <div style="font-weight:800; font-size:18px;">New folder</div>
+        <div class="field"><label class="label">Folder name</label><input id="p_name" class="input" placeholder="e.g. Alice, Work, Family" /></div>
+        <div class="toolbar">
+          <button class="btn accent" id="mAddProfile">Create</button>
+          <div class="spacer"></div>
+          <button class="btn ghost" id="mCancel">Cancel</button>
+        </div>
+      </div>`);
+      $('#mCancel').onclick = closeModal;
+      $('#mAddProfile').onclick = async () => {
+        const name = $('#p_name').value.trim() || 'New Folder';
+        if (vault.profiles[name]) { toast('Folder already exists','error'); return; }
+        vault.profiles[name] = [];
+        activeProfile = name;
+        await persistVault();
+        render();
+        closeModal();
+        toast('Folder created','ok');
+      };
+    }
+
+    // ============================
+    // Event wiring
+    // ============================
+    $('#btnNewItem').onclick = () => { try { ensureUnlocked(); itemForm(); } catch(e){ toast('Unlock first','error'); } };
+    $('#btnNewProfile').onclick = () => { try { ensureUnlocked(); profileForm(); } catch(e){ toast('Unlock first','error'); } };
+    $('#btnLock').onclick = () => lockVault();
+
+    $('#btnExport').onclick = async () => {
+      try { ensureUnlocked(); } catch(e) { toast('Unlock first','error'); return; }
+      const payload = localStorage.getItem(VAULT_KEY);
+      const meta = localStorage.getItem(META_KEY);
+      const blob = new Blob([JSON.stringify({meta: JSON.parse(meta), data: JSON.parse(payload)}, null, 2)], {type: 'application/json'});
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url; a.download = `vault-encrypted-${new Date().toISOString().slice(0,19).replace(/[:T]/g,'-')}.json`;
+      document.body.appendChild(a); a.click(); a.remove();
+      URL.revokeObjectURL(url);
+      toast('Exported encrypted vault','ok');
+    };
+
+    $('#btnImport').onclick = async () => {
+      const input = document.createElement('input');
+      input.type = 'file'; input.accept = 'application/json';
+      input.onchange = async () => {
+        const file = input.files[0]; if (!file) return;
+        const txt = await file.text();
+        try {
+          const obj = JSON.parse(txt);
+          if (!obj.data || !obj.meta) throw new Error('Invalid file');
+          localStorage.setItem(VAULT_KEY, JSON.stringify(obj.data));
+          localStorage.setItem(META_KEY, JSON.stringify(obj.meta));
+          toast('Imported. Please unlock with the corresponding master password.');
+          lockVault();
+        } catch(err) {
+          toast('Import failed: ' + err.message, 'error');
+        }
+      };
+      input.click();
+    };
+
+    $('#itemList').addEventListener('click', async (e) => {
+      const btn = e.target.closest('button'); if (!btn) return;
+      const id = btn.getAttribute('data-id');
+      const action = btn.getAttribute('data-action');
+      const list = vault.profiles[activeProfile] || [];
+      const it = list.find(x=>x.id===id);
+      if (!it) return;
+      touch();
+      if (action==='copy') {
+        await navigator.clipboard.writeText(it.password);
+        toast('Password copied','ok');
+      } else if (action==='reveal') {
+        const span = document.querySelector(`[data-pw="${id}"]`);
+        if (!span) return;
+        const showing = span.textContent.startsWith('•');
+        span.textContent = showing ? it.password : '•'.repeat(12);
+        if (!showing) span.textContent = '•'.repeat(12);
+      } else if (action==='del') {
+        const ok = await confirmDialog({title:'Delete entry?', message:`This cannot be undone.`, okText:'Delete', cancelText:'Cancel'});
+        if (!ok) return;
+        vault.profiles[activeProfile] = list.filter(x => x.id!==id);
+        await persistVault();
+        renderItems();
+        toast('Deleted','ok');
+      } else if (action==='edit') {
+        itemForm(it);
+      }
+    });
+
+    $('#search').addEventListener('input', () => { renderItems(); });
+    $('#btnClearSearch').onclick = () => { $('#search').value=''; renderItems(); };
+
+    // Keyboard shortcuts
+    document.addEventListener('keydown', (e) => {
+      if (e.key==='Escape') lockVault();
+      if ((e.ctrlKey||e.metaKey) && e.key.toLowerCase()==='k') { e.preventDefault(); $('#search').focus(); }
+      if ((e.ctrlKey||e.metaKey) && e.key.toLowerCase()==='n') { e.preventDefault(); $('#btnNewItem').click(); }
+    });
+
+    // Auto-lock timer
+    setInterval(() => {
+      const sel = $('#autolock').value|0;
+      if (!sel || !vault) return;
+      if (Date.now() - lastActive > sel) { toast('Auto-locked'); lockVault(); }
+    }, 5000);
+    document.addEventListener('pointerdown', touch, {passive:true});
+    document.addEventListener('keydown', touch);
+
+    // Auth UI
+    $('#btnGoSetup').onclick = () => { $('#loginForm').hidden = true; $('#setupForm').hidden = false; };
+    $('#btnBackLogin').onclick = () => { $('#setupForm').hidden = true; $('#loginForm').hidden = false; };
+
+    $('#btnUnlock').onclick = async () => {
+      const pw = $('#masterPassword').value;
+      try { await loadVault(pw); toast('Unlocked','ok'); $('#masterPassword').value=''; } catch(err){ toast('Wrong password or no vault found','error'); }
+    };
+
+    function escapeHtml(s) { return (s||'').replace(/[&<>"]+/g, ch => ({'&':'&amp;','<':'&lt;','>':'&gt;','\"':'&quot;'}[ch]||ch)); }
+
+    $('#setupPass').addEventListener('input', () => {
+      const s = passwordStrength($('#setupPass').value);
+      $('#strengthBar').style.width = (s*100/22) + '%';
+    });
+
+    $('#btnCreateVault').onclick = async () => {
+      const a = $('#setupPass').value, b = $('#setupPass2').value;
+      if (!a || a!==b) { toast(!a? 'Enter a password' : 'Passwords do not match','error'); return; }
+      await createVault(a);
+      $('#setupPass').value = $('#setupPass2').value = '';
+      toast('Vault created','ok');
+    };
+
+    // Initial state: show login or blur
+    (function init(){
+      const exists = !!localStorage.getItem(VAULT_KEY);
+      $('#authScreen').hidden = false;
+      $('#mainBody').hidden = true;
+      if (!exists) { $('#loginForm').hidden = true; $('#setupForm').hidden = false; }
+      setBlur(true);
+    })();
+  </script>
+
+  <!--
+    IMPORTANT SECURITY NOTES (readme-style):
+    - This is a purely client-side demo. It encrypts your data with AES-GCM using a key derived
+      from your master password (PBKDF2). The encrypted blob is stored in localStorage.
+    - If you forget your master password, the data cannot be recovered.
+    - Browsers can clear localStorage (e.g., private mode, clearing site data). Export your encrypted vault regularly.
+    - For real-world use, prefer a vetted, audited password manager. This demo is for educational purposes.
+  -->
+</body>
+</html>
